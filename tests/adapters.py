@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
+import itertools
 from collections.abc import Iterable
+from collections import defaultdict
 from typing import IO, Any, BinaryIO
 
+import regex as re
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
@@ -559,6 +562,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
+    tokenizer = BPETokenizer()
     raise NotImplementedError
 
 
@@ -589,4 +593,110 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    assert vocab_size >= len(special_tokens) + 255
+
+    # Initialize vocabulary
+    vocab = {i: i.to_bytes() for i in range(256)}
+    index = len(vocab)
+    for token in special_tokens:
+        vocab[index] = token.encode('utf-8')
+        index += 1
+    merges = []
+    
+    # Read training data and pre-tokenize
+    with open(input_path) as fp:
+        corpus = fp.read()
+        gpt2_pretokenize_pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+        if special_tokens:
+            special_tokens_pattern = '|'.join(map(re.escape, special_tokens))
+            special_tokens_split = re.split(special_tokens_pattern, corpus) # After here is where we can parallelize
+            pretokens = itertools.chain(*(re.finditer(gpt2_pretokenize_pattern, chunk) for chunk in special_tokens_split))
+        else:
+            pretokens = re.finditer(gpt2_pretokenize_pattern, corpus) # Do not treat breaklines separately, might need to change
+
+    pretoken_counts = defaultdict(lambda: 0)
+    for pretoken in pretokens:
+        pretoken = pretoken.group()
+        if pretoken in vocab.values():
+            continue
+        pretoken_counts[tuple(byte.to_bytes() for byte in pretoken.encode('utf-8'))] += 1
+    
+    # print(sorted(pretoken_counts.keys(), key=pretoken_counts.__getitem__, reverse=True))
+    
+    # Initialize bytepair counts and perform BPE
+    for i in range(index, vocab_size): # I could reuse the `index` variable here technically
+        # Room for improvement here!
+        bytepair_counts = defaultdict(lambda: 0)
+        max_pair = (b'', b'')
+        max_count = 0
+        for pretoken, count in pretoken_counts.items():
+            for pair in zip(pretoken, pretoken[1:]):
+                bytepair_counts[pair] += count
+                if bytepair_counts[pair] < max_count:
+                    continue
+                if bytepair_counts[pair] == max_count and pair < max_pair:
+                    continue
+                max_count = bytepair_counts[pair]
+                max_pair = pair
+        # print('\n\n', max_count, max_pair)
+
+        # Perform merge
+        merges.append(max_pair)
+        merged_token = max_pair[0] + max_pair[1]
+        vocab[i] = merged_token
+        for pretoken, count in pretoken_counts.copy().items():
+            if max_pair not in zip(pretoken, pretoken[1:]):
+                continue
+            # print('Merging:', pretoken)
+            del pretoken_counts[pretoken]
+            j = 0
+            while j < len(pretoken) - 1:
+                if (pretoken[j], pretoken[j + 1]) == max_pair:
+                    pretoken = pretoken[:j] + (merged_token,) + pretoken[j+2:]
+                j += 1
+            pretoken_counts[pretoken] = count
+            # print('Result:', pretoken)    
+
+
+    # # Initialize byte pair counts
+    # bytepair_counts = defaultdict(lambda: 0)
+    # # max_pair = (b'',)
+    # # max_count = 0
+    # for pretoken, count in pretoken_counts.items():
+    #     for pair in zip(pretoken, pretoken[1:]):
+    #         bytepair_counts[pair] += count
+    #         # if bytepair_counts[pair] < max_count:
+    #         #     continue
+    #         # max_count = bytepair_counts[pair]
+    #         # max_pair = max((max_pair, pair))
+    #         # sort the pairs
+    # bytepair_sorted = sorted(bytepair_counts.keys(), key=lambda k: (bytepair_counts[k], k), reverse=True)
+    
+    # for i in range(index, vocab_size):
+    #     # Perform merge
+    #     max_pair = bytepair_sorted.pop(0)
+    #     count = bytepair_counts[max_pair]
+    #     merges.append(max_pair)
+    #     merged_token = max_pair[0] + max_pair[1] # Can also use b''.join()
+    #     vocab[i] = merged_token
+
+    #     for pretoken, count in pretoken_counts.copy().items():
+    #         if max_pair not in zip(pretoken, pretoken[1:]):
+    #             continue
+
+    #     # for pretoken, count in pretoken_counts.copy().items():
+    #     #     if max_pair not in zip(pretoken, pretoken[1:]):
+    #     #         continue
+    #     #     # print('Merging:', pretoken)
+    #     #     del pretoken_counts[pretoken]
+    #     #     j = 0
+    #     #     while j < len(pretoken) - 1:
+    #     #         if (pretoken[j], pretoken[j + 1]) == max_pair:
+    #     #             pretoken = pretoken[:j] + (merged_token,) + pretoken[j+2:]
+    #     #             j += 1
+    #     #         j += 1
+    #     #     pretoken_counts[pretoken] = count
+    #     #     # print('Result:', pretoken)
+
+    # print(set(vocab.values()))
+    return vocab, merges
