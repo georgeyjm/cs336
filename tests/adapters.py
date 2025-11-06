@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import os
+import time
 import itertools
 from collections.abc import Iterable
 from collections import defaultdict
 from typing import IO, Any, BinaryIO
+from multiprocessing import Process, Pool, Manager
 
 import regex as re
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from tqdm import tqdm
 
 
 def run_linear(
@@ -595,6 +598,8 @@ def run_train_bpe(
     """
     assert vocab_size >= len(special_tokens) + 255
 
+    DEBUG = True if kwargs.get('debug') else False
+
     # Initialize vocabulary
     vocab = {i: i.to_bytes() for i in range(256)}
     index = len(vocab)
@@ -602,7 +607,10 @@ def run_train_bpe(
         vocab[index] = token.encode('utf-8')
         index += 1
     merges = []
-    
+
+    if DEBUG:
+        print(time.strftime('[%Y/%m/%d %H:%M:%S] Reading file and pretokenizing...'))
+
     # Read training data and pre-tokenize
     with open(input_path) as fp:
         corpus = fp.read()
@@ -613,90 +621,135 @@ def run_train_bpe(
             pretokens = itertools.chain(*(re.finditer(gpt2_pretokenize_pattern, chunk) for chunk in special_tokens_split))
         else:
             pretokens = re.finditer(gpt2_pretokenize_pattern, corpus) # Do not treat breaklines separately, might need to change
-
-    pretoken_counts = defaultdict(lambda: 0)
+    
+    # Counting pretokens
+    pretoken_counts = defaultdict(int)
     for pretoken in pretokens:
         pretoken = pretoken.group()
-        if pretoken in vocab.values():
+        # if pretoken in vocab.values():
+        if pretoken in special_tokens or len(pretoken.encode()) == 1: # Hacky approach
             continue
-        pretoken_counts[tuple(byte.to_bytes() for byte in pretoken.encode('utf-8'))] += 1
-    
-    # print(sorted(pretoken_counts.keys(), key=pretoken_counts.__getitem__, reverse=True))
-    
-    # Initialize bytepair counts and perform BPE
-    for i in range(index, vocab_size): # I could reuse the `index` variable here technically
-        # Room for improvement here!
-        bytepair_counts = defaultdict(lambda: 0)
-        max_pair = (b'', b'')
-        max_count = 0
-        for pretoken, count in pretoken_counts.items():
-            for pair in zip(pretoken, pretoken[1:]):
-                bytepair_counts[pair] += count
-                if bytepair_counts[pair] < max_count:
-                    continue
-                if bytepair_counts[pair] == max_count and pair < max_pair:
-                    continue
-                max_count = bytepair_counts[pair]
-                max_pair = pair
-        # print('\n\n', max_count, max_pair)
+        key = tuple(byte.to_bytes() for byte in pretoken.encode('utf-8'))
+        pretoken_counts[key] += 1
 
-        # Perform merge
+    # # Parallel implementation of chunking, pre-tokenization, and counting
+    # with open(input_path, 'rb') as f:
+    #     num_processes = 4
+    #     # IMPORTANT: WE ONLY PROCESS THE FIRST SPECIAL TOKEN
+    #     boundaries = find_chunk_boundaries(f, num_processes, special_tokens[0].encode())
+    #     manager = Manager()
+    #     pretoken_counts = manager.dict() # defaultdict(int) # Defaults to 0
+    #     with Pool(processes=num_processes) as pool:
+    #         tasks = []
+    #         for start, end in zip(boundaries[:-1], boundaries[1:]):
+    #             f.seek(start)
+    #             chunk = f.read(end - start).decode('utf-8', errors='ignore')
+    #             task = pool.apply_async(count_chunk_pretokens, args=(chunk, special_tokens, pretoken_counts))
+    #             tasks.append(task)
+    #         for task in tasks:
+    #             task.get()
+    
+    if DEBUG:
+        print(time.strftime('[%Y/%m/%d %H:%M:%S] Performing BPE...'))
+        # print(sorted(pretoken_counts.keys(), key=pretoken_counts.__getitem__, reverse=True))
+
+    # Initialize byte pair counts
+    bytepair_counts = defaultdict(int)
+    for pretoken, count in pretoken_counts.items():
+        for pair in zip(pretoken, pretoken[1:]):
+            bytepair_counts[pair] += count
+    
+    # Perform merge while incrementally updating byte pair counts
+    for i in range(index, vocab_size):
+        max_pair = max(bytepair_counts.keys(), key=lambda k: (bytepair_counts[k], k))
         merges.append(max_pair)
-        merged_token = max_pair[0] + max_pair[1]
+        merged_token = max_pair[0] + max_pair[1] # Can also use b''.join()
         vocab[i] = merged_token
+        max_count = bytepair_counts[max_pair]
+        del bytepair_counts[max_pair]
+
         for pretoken, count in pretoken_counts.copy().items():
             if max_pair not in zip(pretoken, pretoken[1:]):
                 continue
-            # print('Merging:', pretoken)
             del pretoken_counts[pretoken]
             j = 0
             while j < len(pretoken) - 1:
                 if (pretoken[j], pretoken[j + 1]) == max_pair:
+                    max_count -= count
+                    if j != 0:
+                        bytepair_counts[(pretoken[j - 1], pretoken[j])] -= count
+                        bytepair_counts[(pretoken[j - 1], merged_token)] += count
+                    if j != len(pretoken) - 2:
+                        bytepair_counts[(pretoken[j + 1], pretoken[j + 2])] -= count
+                        bytepair_counts[(merged_token, pretoken[j + 2])] += count
                     pretoken = pretoken[:j] + (merged_token,) + pretoken[j+2:]
                 j += 1
             pretoken_counts[pretoken] = count
-            # print('Result:', pretoken)    
-
-
-    # # Initialize byte pair counts
-    # bytepair_counts = defaultdict(lambda: 0)
-    # # max_pair = (b'',)
-    # # max_count = 0
-    # for pretoken, count in pretoken_counts.items():
-    #     for pair in zip(pretoken, pretoken[1:]):
-    #         bytepair_counts[pair] += count
-    #         # if bytepair_counts[pair] < max_count:
-    #         #     continue
-    #         # max_count = bytepair_counts[pair]
-    #         # max_pair = max((max_pair, pair))
-    #         # sort the pairs
-    # bytepair_sorted = sorted(bytepair_counts.keys(), key=lambda k: (bytepair_counts[k], k), reverse=True)
-    
-    # for i in range(index, vocab_size):
-    #     # Perform merge
-    #     max_pair = bytepair_sorted.pop(0)
-    #     count = bytepair_counts[max_pair]
-    #     merges.append(max_pair)
-    #     merged_token = max_pair[0] + max_pair[1] # Can also use b''.join()
-    #     vocab[i] = merged_token
-
-    #     for pretoken, count in pretoken_counts.copy().items():
-    #         if max_pair not in zip(pretoken, pretoken[1:]):
-    #             continue
-
-    #     # for pretoken, count in pretoken_counts.copy().items():
-    #     #     if max_pair not in zip(pretoken, pretoken[1:]):
-    #     #         continue
-    #     #     # print('Merging:', pretoken)
-    #     #     del pretoken_counts[pretoken]
-    #     #     j = 0
-    #     #     while j < len(pretoken) - 1:
-    #     #         if (pretoken[j], pretoken[j + 1]) == max_pair:
-    #     #             pretoken = pretoken[:j] + (merged_token,) + pretoken[j+2:]
-    #     #             j += 1
-    #     #         j += 1
-    #     #     pretoken_counts[pretoken] = count
-    #     #     # print('Result:', pretoken)
 
     # print(set(vocab.values()))
+    if DEBUG:
+        print(time.strftime('[%Y/%m/%d %H:%M:%S] Finished BPE.'))
     return vocab, merges
+
+
+def count_chunk_pretokens(chunk, special_tokens, pretoken_counts):
+    gpt2_pretokenize_regex = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+    special_tokens_regex = re.compile('|'.join(map(re.escape, special_tokens)))
+
+    docs = special_tokens_regex.split(chunk)
+    pretokens = itertools.chain(*(gpt2_pretokenize_regex.finditer(doc) for doc in docs))
+    for pretoken in pretokens:
+        pretoken = pretoken.group()
+        # if pretoken in vocab.values():
+        if pretoken in special_tokens or len(pretoken.encode()) == 1: # Hacky approach
+            continue
+        key = tuple(byte.to_bytes() for byte in pretoken.encode('utf-8'))
+        pretoken_counts.setdefault(key, 0)
+        pretoken_counts[key] = pretoken_counts[key] + 1
+
+
+def find_chunk_boundaries(
+    file: BinaryIO,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    """
+    Chunk the file into parts that can be counted independently.
+    May return fewer chunks if the boundaries end up overlapping.
+    """
+    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+
+    # Get total file size in bytes
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    # Initial guesses for chunk boundary locations, uniformly spaced
+    # Chunks start on previous index, don't include last index
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)  # Start at boundary guess
+        while True:
+            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+            # If EOF, this boundary should be at the end of the file
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            # Find the special token in the mini chunk
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+    return sorted(set(chunk_boundaries))
