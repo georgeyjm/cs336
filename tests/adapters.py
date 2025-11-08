@@ -3,9 +3,10 @@ from __future__ import annotations
 import os
 import time
 import itertools
+import json
 from collections.abc import Iterable
 from collections import defaultdict
-from typing import IO, Any, BinaryIO
+from typing import IO, Any, BinaryIO, Iterator
 from multiprocessing import Process, Pool, Manager
 
 import regex as re
@@ -545,11 +546,116 @@ def run_load_checkpoint(
     raise NotImplementedError
 
 
+class BPETokenizer:
+
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None
+    ):
+        self.vocab = vocab
+        self.vocab_reverse = None # dict[bytes, int]
+        self.merges = merges
+        if special_tokens:
+            self.special_tokens = sorted(special_tokens, key=len, reverse=True) # To prioritze forms of XX over X
+        else:
+            self.special_tokens = special_tokens
+    
+    @classmethod
+    def from_files(
+        cls,
+        vocab_filepath: str,
+        merges_filepath: str,
+        special_tokens: list[str] | None = None
+    ):
+        '''
+        Constructs and return a Tokenizer from a serialized vocabulary and list of merges
+        (in the same format that your BPE training code output) and (optionally) a list of special tokens.
+        '''
+        # with open(vocab_filepath) as f:
+        raise NotImplementedError
+    
+    def encode(self, text: str) -> list[int]:
+        '''Encode an input text into a sequence of token IDs.'''
+        # Reverse vocab to encode bytes into int
+        if not self.vocab_reverse:
+            self.vocab_reverse = {v: k for k, v in self.vocab.items()}
+        
+        # Pretokenize the text, respecting boundaries
+        # TODO: This part of the code is reused from training tokenizer. Better if abstracted (after parallelization).
+        gpt2_pretokenize_pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+        if self.special_tokens:
+            special_tokens_pattern = '(' + '|'.join(map(re.escape, self.special_tokens)) + ')' # Parenthese to keep the delimiters
+            special_tokens_split = re.split(special_tokens_pattern, text) # After here is where we can parallelize
+            # pretokens = itertools.chain((re.finditer(gpt2_pretokenize_pattern, chunk) if chunk not in self.special_tokens else [chunk] for chunk in special_tokens_split)) # Kind of hacky
+            pretokens_iterators = (re.finditer(gpt2_pretokenize_pattern, chunk) if chunk not in self.special_tokens else chunk for chunk in special_tokens_split) # Kind of hacky
+        else:
+            pretokens_iterators = (re.finditer(gpt2_pretokenize_pattern, text),) # Hacky treatment to maintain consistency with case above
+        
+        encoded_ids = []
+        for iter in pretokens_iterators:
+            if isinstance(iter, str) and iter in self.special_tokens: # No need to check for self.special_tokens here!
+                encoded_ids.append(self.vocab_reverse.get(iter.encode()))
+                continue
+            for pretoken in iter:
+                # if not pretoken:
+                #     continue
+                # No special tokens will appear here
+                pretoken = pretoken.group()
+                pretoken = tuple(map(int.to_bytes, pretoken.encode()))
+                for merge_pair in self.merges: # Seems kind of inefficient
+                    merged_token = merge_pair[0] + merge_pair[1] # Can also use b''.join()
+                    j = 0
+                    while j < len(pretoken) - 1:
+                        if (pretoken[j], pretoken[j + 1]) == merge_pair:
+                            pretoken = pretoken[:j] + (merged_token,) + pretoken[j+2:]
+                        j += 1
+                encoded_ids += map(self.vocab_reverse.get, pretoken)
+        return encoded_ids
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        '''
+        Given an iterable of strings (e.g., a Python file handle), return a generator that lazily yields token IDs.
+        This is required for memory-eﬀicient tokenization of large files that we cannot directly load into memory.
+        '''
+        if not self.vocab_reverse:
+            self.vocab_reverse = {v: k for k, v in self.vocab.items()}
+        
+        # No special tokens for boundaries, what should I do???
+        if not self.special_tokens:
+            for token_id in self.encode(iterable.read()):
+                yield token_id
+            return
+
+        # Idea: read lines until a special token appears, serving as a chunk boundary. Yield encoded IDs in that chunk.
+        special_tokens_pattern = '|'.join(map(re.escape, self.special_tokens))
+        chunk = ''
+        for line in iterable: # I can reuse the find_chunk_boundaries function
+            if (m := re.search(special_tokens_pattern, line)) is None:
+                chunk += line
+                continue
+            end_index = m.span()[1]
+            chunk += line[:end_index]
+            for token_id in self.encode(chunk):
+                yield token_id
+            chunk = line[end_index:]
+        for token_id in self.encode(chunk):
+            yield token_id
+
+    def decode(self, ids: list[int]) -> str:
+        '''Decode a sequence of token IDs into text.'''
+        bytes_sequence = b''
+        for token_id in ids:
+            bytes_sequence += self.vocab.get(token_id, b'\x00') # Should I leave a default? Or assert?
+        return bytes.decode(bytes_sequence, errors='replace')
+
+
 def get_tokenizer(
     vocab: dict[int, bytes],
     merges: list[tuple[bytes, bytes]],
     special_tokens: list[str] | None = None,
-) -> Any:
+) -> BPETokenizer:
     """Given a vocabulary, a list of merges, and a list of special tokens,
     return a BPE tokenizer that uses the provided vocab, merges, and special tokens.
 
@@ -565,8 +671,8 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    tokenizer = BPETokenizer()
-    raise NotImplementedError
+    tokenizer = BPETokenizer(vocab, merges, special_tokens)
+    return tokenizer
 
 
 def run_train_bpe(
@@ -627,9 +733,9 @@ def run_train_bpe(
     for pretoken in pretokens:
         pretoken = pretoken.group()
         # if pretoken in vocab.values():
-        if pretoken in special_tokens or len(pretoken.encode()) == 1: # Hacky approach
+        if len(pretoken.encode()) == 1: # Hacky approach # No need to check pretoken in special_tokens, since all special tokens are used to split
             continue
-        key = tuple(byte.to_bytes() for byte in pretoken.encode('utf-8'))
+        key = tuple(map(int.to_bytes, pretoken.encode()))
         pretoken_counts[key] += 1
 
     # # Parallel implementation of chunking, pre-tokenization, and counting
@@ -665,7 +771,6 @@ def run_train_bpe(
         merges.append(max_pair)
         merged_token = max_pair[0] + max_pair[1] # Can also use b''.join()
         vocab[i] = merged_token
-        max_count = bytepair_counts[max_pair]
         del bytepair_counts[max_pair]
 
         for pretoken, count in pretoken_counts.copy().items():
@@ -675,7 +780,6 @@ def run_train_bpe(
             j = 0
             while j < len(pretoken) - 1:
                 if (pretoken[j], pretoken[j + 1]) == max_pair:
-                    max_count -= count
                     if j != 0:
                         bytepair_counts[(pretoken[j - 1], pretoken[j])] -= count
                         bytepair_counts[(pretoken[j - 1], merged_token)] += count
