@@ -17,6 +17,9 @@ from torch import Tensor
 from tqdm import tqdm
 
 
+GPT2_PRETOKENIZER = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+
+
 def run_linear(
     d_in: int,
     d_out: int,
@@ -559,6 +562,7 @@ class BPETokenizer:
         self.merges = merges
         if special_tokens:
             self.special_tokens = sorted(special_tokens, key=len, reverse=True) # To prioritze forms of XX over X
+            self.special_tokens_pattern = '|'.join(map(re.escape, self.special_tokens))
         else:
             self.special_tokens = special_tokens
     
@@ -584,17 +588,19 @@ class BPETokenizer:
         
         # Pretokenize the text, respecting boundaries
         # TODO: This part of the code is reused from training tokenizer. Better if abstracted (after parallelization).
-        gpt2_pretokenize_pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
         if self.special_tokens:
-            special_tokens_pattern = '(' + '|'.join(map(re.escape, self.special_tokens)) + ')' # Parenthese to keep the delimiters
-            special_tokens_split = re.split(special_tokens_pattern, text) # After here is where we can parallelize
-            # pretokens = itertools.chain((re.finditer(gpt2_pretokenize_pattern, chunk) if chunk not in self.special_tokens else [chunk] for chunk in special_tokens_split)) # Kind of hacky
-            pretokens_iterators = (re.finditer(gpt2_pretokenize_pattern, chunk) if chunk not in self.special_tokens else chunk for chunk in special_tokens_split) # Kind of hacky
+            special_tokens_capturing_pattern = f'({self.special_tokens_pattern})' # Parenthese to capture the delimiters too
+            special_tokens_split = re.split(special_tokens_capturing_pattern, text) # After here is where we can parallelize
+            special_tokens_split = filter(bool, special_tokens_split) # Filter out empty chunks
+            # pretokens = itertools.chain((GPT2_PRETOKENIZER.finditer(chunk) if chunk not in self.special_tokens else [chunk] for chunk in special_tokens_split)) # Kind of hacky
+            # Very hacky approach! Mixing iterators and strings in one list
+            pretokens_iterators = (GPT2_PRETOKENIZER.finditer(chunk) if chunk not in self.special_tokens else chunk for chunk in special_tokens_split)
         else:
-            pretokens_iterators = (re.finditer(gpt2_pretokenize_pattern, text),) # Hacky treatment to maintain consistency with case above
+            pretokens_iterators = (GPT2_PRETOKENIZER.finditer(text),) # Hacky treatment to maintain consistency with case above
         
         encoded_ids = []
         for iter in pretokens_iterators:
+            # Deal with special case of special tokens
             if isinstance(iter, str) and iter in self.special_tokens: # No need to check for self.special_tokens here!
                 encoded_ids.append(self.vocab_reverse.get(iter.encode()))
                 continue
@@ -604,12 +610,15 @@ class BPETokenizer:
                 # No special tokens will appear here
                 pretoken = pretoken.group()
                 pretoken = tuple(map(int.to_bytes, pretoken.encode()))
+                # Merging tokens by order of creation
                 for merge_pair in self.merges: # Seems kind of inefficient
                     merged_token = merge_pair[0] + merge_pair[1] # Can also use b''.join()
                     j = 0
                     while j < len(pretoken) - 1:
                         if (pretoken[j], pretoken[j + 1]) == merge_pair:
                             pretoken = pretoken[:j] + (merged_token,) + pretoken[j+2:]
+                            if len(pretoken) == 1:
+                                break
                         j += 1
                 encoded_ids += map(self.vocab_reverse.get, pretoken)
         return encoded_ids
@@ -629,10 +638,9 @@ class BPETokenizer:
             return
 
         # Idea: read lines until a special token appears, serving as a chunk boundary. Yield encoded IDs in that chunk.
-        special_tokens_pattern = '|'.join(map(re.escape, self.special_tokens))
         chunk = ''
         for line in iterable: # I can reuse the find_chunk_boundaries function
-            if (m := re.search(special_tokens_pattern, line)) is None:
+            if (m := re.search(self.special_tokens_pattern, line)) is None:
                 chunk += line
                 continue
             end_index = m.span()[1]
@@ -671,8 +679,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    tokenizer = BPETokenizer(vocab, merges, special_tokens)
-    return tokenizer
+    return BPETokenizer(vocab, merges, special_tokens)
 
 
 def run_train_bpe(
@@ -720,13 +727,12 @@ def run_train_bpe(
     # Read training data and pre-tokenize
     with open(input_path) as fp:
         corpus = fp.read()
-        gpt2_pretokenize_pattern = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
         if special_tokens:
             special_tokens_pattern = '|'.join(map(re.escape, special_tokens))
             special_tokens_split = re.split(special_tokens_pattern, corpus) # After here is where we can parallelize
-            pretokens = itertools.chain(*(re.finditer(gpt2_pretokenize_pattern, chunk) for chunk in special_tokens_split))
+            pretokens = itertools.chain(*(GPT2_PRETOKENIZER.finditer(chunk) for chunk in special_tokens_split))
         else:
-            pretokens = re.finditer(gpt2_pretokenize_pattern, corpus) # Do not treat breaklines separately, might need to change
+            pretokens = GPT2_PRETOKENIZER.finditer(corpus) # Do not treat breaklines separately, might need to change
     
     # Counting pretokens
     pretoken_counts = defaultdict(int)
@@ -797,11 +803,10 @@ def run_train_bpe(
 
 
 def count_chunk_pretokens(chunk, special_tokens, pretoken_counts):
-    gpt2_pretokenize_regex = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
     special_tokens_regex = re.compile('|'.join(map(re.escape, special_tokens)))
 
     docs = special_tokens_regex.split(chunk)
-    pretokens = itertools.chain(*(gpt2_pretokenize_regex.finditer(doc) for doc in docs))
+    pretokens = itertools.chain(*(GPT2_PRETOKENIZER.finditer(doc) for doc in docs))
     for pretoken in pretokens:
         pretoken = pretoken.group()
         # if pretoken in vocab.values():
